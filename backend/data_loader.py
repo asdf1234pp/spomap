@@ -81,6 +81,7 @@ def explode_categories(df: pd.DataFrame, region_col: str) -> pd.DataFrame:
 def normalize_series(s: pd.Series) -> pd.Series:
     """
     0~1 사이로 정규화. 값이 전부 같으면 0.5로 통일.
+    (지금은 직접 사용하진 않지만, 필요시 대비로 놔둠)
     """
     s = s.astype(float)
     min_v = s.min()
@@ -189,7 +190,7 @@ def load_data():
     coords_df = coords_df.dropna(subset=["region_id", "lat", "lng"])
     region_coords = coords_df.groupby("region_id").agg({"lat": "mean", "lng": "mean"}).reset_index()
 
-    # 6) 공급 지표 계산 (sport별 지역당 시설 수 → 인구 10만 명당 수)
+    # 6) 공급 지표 계산 (sport별 지역당 시설 수 → 인구 10만 명당 수 → 백분위 점수)
     vouch_cat = explode_categories(vouch, "region_id")
     pub_cat = explode_categories(pub, "region_id")
 
@@ -203,34 +204,42 @@ def load_data():
     supply = supply.dropna(subset=["total_pop"])
     supply["supply_per_100k"] = supply["supply_raw"] / (supply["total_pop"] / 100000.0)
 
+    # ▶ 변경 포인트 1: min-max 대신 "백분위 랭크" 기반 점수로 변환
     supply_scores: Dict[Tuple[str, str], float] = {}
     for sport in SPORT_LIST:
         sub = supply[supply["sport_cat"] == sport].copy()
         if sub.empty:
             continue
-        vals = sub["supply_per_100k"].values
-        min_v, max_v = vals.min(), vals.max()
-        if max_v - min_v < 1e-9:
-            sub["score"] = 50.0
-        else:
-            sub["score"] = 100.0 * (sub["supply_per_100k"] - min_v) / (max_v - min_v)
+        # supply_per_100k가 낮은 지역은 낮은 백분위, 높은 지역은 높은 백분위
+        # pct=True → 0~1 사이 값 (1/N, 2/N, ..., 1)
+        sub["score_pct"] = sub["supply_per_100k"].rank(pct=True)
+        sub["score"] = 100.0 * sub["score_pct"]
         for _, row in sub.iterrows():
             supply_scores[(row["region_id"], sport)] = float(row["score"])
 
-    # 7) 수요 지표 계산 (active_pop + 국민체력100 측정 빈도)
+    # 7) 수요 지표 계산 (active_pop + 국민체력100 측정 빈도 → 백분위 점수)
     pop2 = pop.merge(fit_region_counts, on="region_id", how="left")
     pop2["fitness_cnt"] = pop2["fitness_cnt"].fillna(0)
     pop2["active_rate"] = pop2["active_pop"] / pop2["total_pop"].replace(0, np.nan)
     pop2["fitness_per_10k"] = pop2["fitness_cnt"] / (pop2["total_pop"] / 10000.0).replace(0, np.nan)
 
-    pop2["active_norm"] = normalize_series(pop2["active_rate"])
-    if (pop2["fitness_per_10k"] > 0).any():
-        pop2["fitness_norm"] = normalize_series(pop2["fitness_per_10k"])
+    # ▶ 변경 포인트 2: active_rate, fitness_per_10k도 백분위 랭크로 압축
+    # active_rate 백분위
+    pop2["active_pct"] = pop2["active_rate"].rank(pct=True)
+    # fitness_per_10k 백분위 (전부 0이거나 NaN이면 0.5로 고정)
+    mask_fit = pop2["fitness_per_10k"].notna() & (pop2["fitness_per_10k"] > 0)
+    if mask_fit.any():
+        pop2.loc[mask_fit, "fitness_pct"] = pop2.loc[mask_fit, "fitness_per_10k"].rank(pct=True)
+        pop2["fitness_pct"] = pop2["fitness_pct"].fillna(0.5)
     else:
-        pop2["fitness_norm"] = 0.5
-    pop2["demand_score"] = 100.0 * (0.7 * pop2["active_norm"] + 0.3 * pop2["fitness_norm"])
+        pop2["fitness_pct"] = 0.5
 
-    # 8) METRICS 딕셔너리 생성
+    # 0~100 점수로 변환 (여기서도 분산이 너무 크지 않게 가중 평균)
+    pop2["demand_score"] = 100.0 * (
+        0.7 * pop2["active_pct"] + 0.3 * pop2["fitness_pct"]
+    )
+
+    # 8) METRICS 딕셔너리 생성 (EDI = demand - supply)
     METRICS: Dict[Tuple[str, str], Dict[str, float]] = {}
     for sport in SPORT_LIST:
         for _, row in pop2.iterrows():
