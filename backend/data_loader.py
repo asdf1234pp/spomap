@@ -13,6 +13,8 @@ FILE_FITNESS = DATA_DIR / "KS_NFA_FTNESS_MESURE_STTUS_202507.csv"
 FILE_VOUCH = DATA_DIR / "KS_SPORTS_VOUCH_FCLTY_INFO_202507.csv"
 FILE_PUBLIC = DATA_DIR / "KS_WNTY_PUBLIC_PHSTRN_FCLTY_STTUS_202507.csv"
 FILE_POP = DATA_DIR / "KCB_SIGNGU_DATA3_09_202509 (1).csv"
+PROCESSED_REGIONS = DATA_DIR / "regions_processed.csv"
+PROCESSED_METRICS = DATA_DIR / "metrics_processed.csv"
 
 # 3. 사용할 스포츠 카테고리 (내부 코드용)
 SPORT_LIST = ["ball_sports", "fitness", "swimming", "pilates_yoga"]
@@ -142,7 +144,41 @@ def load_data():
       - METRICS: (region_id, sport)별 demand/supply/edi
       - SPORTS: 사용 가능한 스포츠 카테고리 목록
     을 만들어서 반환.
+    캐시 파일(regions_processed.csv, metrics_processed.csv)이 있으면
+    그걸 먼저 읽어서 빠르게 로딩한다.
     """
+    # 0) 캐시 파일이 이미 있으면: 빠른 경로
+    if PROCESSED_REGIONS.exists() and PROCESSED_METRICS.exists():
+        regions_df = pd.read_csv(PROCESSED_REGIONS)
+        metrics_df = pd.read_csv(PROCESSED_METRICS)
+
+        REGIONS = [
+            {
+                "id": str(row["id"]),
+                "name": str(row["name"]),
+                "lat": float(row["lat"]),
+                "lng": float(row["lng"]),
+            }
+            for _, row in regions_df.iterrows()
+        ]
+
+        METRICS: Dict[Tuple[str, str], Dict[str, float]] = {}
+        for _, row in metrics_df.iterrows():
+            key = (str(row["region_id"]), str(row["sport"]))
+            METRICS[key] = {
+                "demand_score": float(row["demand_score"]),
+                "supply_score": float(row["supply_score"]),
+                "edi": float(row["edi"]),
+            }
+
+        SPORTS = [
+            ("ball_sports", "구기/필드종목"),
+            ("fitness", "헬스/체력단련"),
+            ("swimming", "수영"),
+            ("pilates_yoga", "필라테스/요가"),
+        ]
+        return REGIONS, METRICS, SPORTS
+
     # 1) 인구 데이터 (시군구별 연령대 인구)
     pop = pd.read_csv(FILE_POP)
     pop["region_id"] = pop["SIGNGU_CD"].astype(str).str.zfill(5)
@@ -204,14 +240,11 @@ def load_data():
     supply = supply.dropna(subset=["total_pop"])
     supply["supply_per_100k"] = supply["supply_raw"] / (supply["total_pop"] / 100000.0)
 
-    # ▶ 변경 포인트 1: min-max 대신 "백분위 랭크" 기반 점수로 변환
     supply_scores: Dict[Tuple[str, str], float] = {}
     for sport in SPORT_LIST:
         sub = supply[supply["sport_cat"] == sport].copy()
         if sub.empty:
             continue
-        # supply_per_100k가 낮은 지역은 낮은 백분위, 높은 지역은 높은 백분위
-        # pct=True → 0~1 사이 값 (1/N, 2/N, ..., 1)
         sub["score_pct"] = sub["supply_per_100k"].rank(pct=True)
         sub["score"] = 100.0 * sub["score_pct"]
         for _, row in sub.iterrows():
@@ -223,10 +256,7 @@ def load_data():
     pop2["active_rate"] = pop2["active_pop"] / pop2["total_pop"].replace(0, np.nan)
     pop2["fitness_per_10k"] = pop2["fitness_cnt"] / (pop2["total_pop"] / 10000.0).replace(0, np.nan)
 
-    # ▶ 변경 포인트 2: active_rate, fitness_per_10k도 백분위 랭크로 압축
-    # active_rate 백분위
     pop2["active_pct"] = pop2["active_rate"].rank(pct=True)
-    # fitness_per_10k 백분위 (전부 0이거나 NaN이면 0.5로 고정)
     mask_fit = pop2["fitness_per_10k"].notna() & (pop2["fitness_per_10k"] > 0)
     if mask_fit.any():
         pop2.loc[mask_fit, "fitness_pct"] = pop2.loc[mask_fit, "fitness_per_10k"].rank(pct=True)
@@ -234,7 +264,6 @@ def load_data():
     else:
         pop2["fitness_pct"] = 0.5
 
-    # 0~100 점수로 변환 (여기서도 분산이 너무 크지 않게 가중 평균)
     pop2["demand_score"] = 100.0 * (
         0.7 * pop2["active_pct"] + 0.3 * pop2["fitness_pct"]
     )
@@ -271,5 +300,23 @@ def load_data():
         ("swimming", "수영"),
         ("pilates_yoga", "필라테스/요가"),
     ]
+
+    # 10) 계산 결과를 캐시 파일로 저장 (다음 부터는 빠른 경로 사용)
+    regions_df_to_save = pd.DataFrame(REGIONS)
+    regions_df_to_save.to_csv(PROCESSED_REGIONS, index=False, encoding="utf-8")
+
+    rows = []
+    for (rid, sport), m in METRICS.items():
+        rows.append(
+            {
+                "region_id": rid,
+                "sport": sport,
+                "demand_score": m["demand_score"],
+                "supply_score": m["supply_score"],
+                "edi": m["edi"],
+            }
+        )
+    metrics_df_to_save = pd.DataFrame(rows)
+    metrics_df_to_save.to_csv(PROCESSED_METRICS, index=False, encoding="utf-8")
 
     return REGIONS, METRICS, SPORTS
